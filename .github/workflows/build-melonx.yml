@@ -1,3 +1,6 @@
+# Optional GitHub Actions build. Not executed or uploaded by Codex.
+# Put this at .github/workflows/build-melonx.yml in a small build repository.
+# Put melonx-device-motion.patch and verify-motion.py at that repository's root.
 name: Build MeloNX device motion
 
 on:
@@ -31,6 +34,46 @@ jobs:
         uses: actions/setup-dotnet@v6
         with:
           global-json-file: source/global.json
+
+      # The pinned upstream revision maps Ryujinx.LibHac only to a custom
+      # "LibHacAlpha" feed that no longer serves it, so restore fails with
+      # NU1101. This removes that feed so the package resolves from nuget.org.
+      - name: Point Ryujinx.LibHac at nuget.org
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cfg="$(find . -maxdepth 1 -iname 'nuget.config' | head -n1)"
+          test -n "$cfg"
+          echo "--- nuget.config before ---"; cat "$cfg"
+          python3 - "$cfg" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          path = sys.argv[1]
+          tree = ET.parse(path)
+          root = tree.getroot()
+
+          # Drop the dead LibHacAlpha feed.
+          for sources in root.iter("packageSources"):
+              for node in list(sources):
+                  if node.tag == "add" and node.get("key") == "LibHacAlpha":
+                      sources.remove(node)
+
+          # Drop its mapping and make sure nuget.org may serve Ryujinx.LibHac.
+          for mapping in root.iter("packageSourceMapping"):
+              for node in list(mapping):
+                  if node.get("key") == "LibHacAlpha":
+                      mapping.remove(node)
+                  elif node.get("key") == "nuget.org":
+                      if not any(p.get("pattern") == "Ryujinx.LibHac" for p in node):
+                          ET.SubElement(node, "package", pattern="Ryujinx.LibHac")
+
+          tree.write(path, encoding="utf-8", xml_declaration=True)
+          PY
+          echo "--- nuget.config after ---"; cat "$cfg"
+          echo "--- pinned LibHac version ---"
+          grep -rn "LibHac" Directory.Packages.props || true
 
       - name: Check toolchain and motion logic
         shell: bash
