@@ -1,0 +1,84 @@
+name: Build MeloNX device motion
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    steps:
+      - name: Read build files
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Get the inspected MeloNX revision and apply the patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://starforgejo.dev/projects/MeloNX
+          git -C source fetch --depth 1 origin 13700519f3abc4e6d7ed8a065b118b2cc59bcd67
+          git -C source checkout --detach FETCH_HEAD
+          git -C source apply --check "$GITHUB_WORKSPACE/melonx-device-motion.patch"
+          git -C source apply "$GITHUB_WORKSPACE/melonx-device-motion.patch"
+
+      - name: Install the repository's .NET SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: source/global.json
+
+      - name: Check toolchain and motion logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          dotnet --info
+          python3 verify-motion.py source
+
+      - name: Build using the repository's Xcode scheme and its .NET build target
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project src/MeloNX/MeloNX.xcodeproj \
+            -scheme MeloNX \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/MeloNXDerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: Package an unsigned IPA for later signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/MeloNXDerivedData/Build/Products/Release-iphoneos/MeloNX.app"
+          test -d "$app"
+          mkdir -p "$RUNNER_TEMP/MeloNXPackage/Payload"
+          ditto "$app" "$RUNNER_TEMP/MeloNXPackage/Payload/MeloNX.app"
+          cd "$RUNNER_TEMP/MeloNXPackage"
+          /usr/bin/zip -qry "$GITHUB_WORKSPACE/MeloNX-device-motion-unsigned.ipa" Payload
+
+      - name: Save the unsigned IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: MeloNX-device-motion-unsigned
+          path: MeloNX-device-motion-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Save the build log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: MeloNX-build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
