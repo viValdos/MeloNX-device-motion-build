@@ -46,45 +46,114 @@ jobs:
 
       # Must run AFTER verify-motion.py: that script runs `git diff --check` and
       # requires that only Swift/xcstrings files differ from the base commit.
-      # The pinned upstream revision maps Ryujinx.LibHac only to a custom
-      # "LibHacAlpha" feed that no longer serves it, so restore fails with
-      # NU1101. This removes that feed so the package resolves from nuget.org.
-      - name: Point Ryujinx.LibHac at nuget.org
+      #
+      # The pinned upstream revision needs Ryujinx.LibHac 0.21.0-alpha.129, which
+      # only ever lived on a custom feed that no longer serves it (nuget.org's
+      # newest copy is 0.20.0). This step downloads that exact package, checks its
+      # SHA-256, and points NuGet at a local folder feed.
+      #
+      # Fallback: if every download fails, put the same .nupkg in this repository
+      # at vendor/Ryujinx.LibHac.0.21.0-alpha.129.nupkg (it is hash-checked too).
+      - name: Provide Ryujinx.LibHac from a verified local feed
         working-directory: source
         shell: bash
+        env:
+          LIBHAC_VERSION: "0.21.0-alpha.129"
+          # SHA-256 of the .nupkg, taken from an independent package manifest
+          # (Nix deps file, sha256-vwpjCsMZayUAzaydzcO9ktEzNIYEmDpQbhswGx8O7no=).
+          LIBHAC_SHA256: "bf0a630ac3196b2500cdac9dcdc3bd92d133348604983a506e1b301b1f0eee7a"
         run: |
           set -euo pipefail
-          cfg="$(find . -maxdepth 1 -iname 'nuget.config' | head -n1)"
-          test -n "$cfg"
-          echo "--- nuget.config before ---"; cat "$cfg"
-          python3 - "$cfg" <<'PY'
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import pathlib
+          import subprocess
           import sys
           import xml.etree.ElementTree as ET
 
-          path = sys.argv[1]
-          tree = ET.parse(path)
-          root = tree.getroot()
+          version = os.environ["LIBHAC_VERSION"]
+          expected = os.environ["LIBHAC_SHA256"].lower()
+          workspace = pathlib.Path(os.environ["GITHUB_WORKSPACE"])
+          feed = pathlib.Path(os.environ["RUNNER_TEMP"]) / "libhac-feed"
+          feed.mkdir(parents=True, exist_ok=True)
+          target = feed / f"Ryujinx.LibHac.{version}.nupkg"
 
-          # Drop the dead LibHacAlpha feed.
+          # 1. The version the repository actually asks for must be the one we vouch for.
+          pinned = None
+          for node in ET.parse("Directory.Packages.props").getroot().iter():
+              if node.get("Include") == "Ryujinx.LibHac":
+                  pinned = node.get("Version") or node.get("VersionOverride")
+          print("Pinned Ryujinx.LibHac version:", pinned)
+          if pinned != version:
+              sys.exit(f"Repository pins {pinned!r}, this workflow was written for {version!r}. "
+                       "Update LIBHAC_VERSION and LIBHAC_SHA256 together.")
+
+          def sha256(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def accept(path, origin):
+              actual = sha256(path)
+              print(f"  {origin}: sha256 {actual}")
+              if actual == expected:
+                  return True
+              print("  -> hash mismatch, rejected")
+              return False
+
+          candidates = [
+              workspace / "vendor" / f"Ryujinx.LibHac.{version}.nupkg",
+          ]
+          urls = [
+              f"https://git.ryujinx.app/api/packages/projects/nuget/package/ryujinx.libhac/{version}/ryujinx.libhac.{version}.nupkg",
+              f"https://legacy.git.ryujinx.app/api/v4/projects/17/packages/nuget/download/ryujinx.libhac/{version}/ryujinx.libhac.{version}.nupkg",
+          ]
+
+          ok = False
+          for path in candidates:
+              if path.is_file():
+                  print("Trying local file", path)
+                  if accept(path, str(path)):
+                      target.write_bytes(path.read_bytes())
+                      ok = True
+                      break
+          if not ok:
+              for url in urls:
+                  print("Downloading", url)
+                  result = subprocess.run(
+                      ["curl", "--fail", "--location", "--silent", "--show-error",
+                       "--retry", "3", "--connect-timeout", "20", "--max-time", "180",
+                       "--output", str(target), url])
+                  if result.returncode == 0 and target.is_file() and accept(target, url):
+                      ok = True
+                      break
+                  target.unlink(missing_ok=True)
+          if not ok:
+              sys.exit("Could not obtain a hash-verified Ryujinx.LibHac "
+                       f"{version}. Add it as vendor/Ryujinx.LibHac.{version}.nupkg "
+                       "in the build repository, or build LibHac from source.")
+          print("Verified package ready:", target)
+
+          # 2. Repoint NuGet: drop the dead feed, add the local feed for this one package.
+          cfg = next(p for p in pathlib.Path(".").iterdir() if p.name.lower() == "nuget.config")
+          print("--- nuget.config before ---")
+          print(cfg.read_text(encoding="utf-8-sig"))
+          tree = ET.parse(cfg)
+          root = tree.getroot()
           for sources in root.iter("packageSources"):
               for node in list(sources):
                   if node.tag == "add" and node.get("key") == "LibHacAlpha":
                       sources.remove(node)
-
-          # Drop its mapping and make sure nuget.org may serve Ryujinx.LibHac.
+              ET.SubElement(sources, "add", key="LocalLibHac", value=str(feed))
           for mapping in root.iter("packageSourceMapping"):
               for node in list(mapping):
                   if node.get("key") == "LibHacAlpha":
                       mapping.remove(node)
-                  elif node.get("key") == "nuget.org":
-                      if not any(p.get("pattern") == "Ryujinx.LibHac" for p in node):
-                          ET.SubElement(node, "package", pattern="Ryujinx.LibHac")
-
-          tree.write(path, encoding="utf-8", xml_declaration=True)
+              local = ET.SubElement(mapping, "packageSource", key="LocalLibHac")
+              ET.SubElement(local, "package", pattern="Ryujinx.LibHac")
+          tree.write(cfg, encoding="utf-8", xml_declaration=True)
+          print("--- nuget.config after ---")
+          print(cfg.read_text(encoding="utf-8"))
           PY
-          echo "--- nuget.config after ---"; cat "$cfg"
-          echo "--- pinned LibHac version ---"
-          grep -rn "LibHac" Directory.Packages.props || true
 
       - name: Build using the repository's Xcode scheme and its .NET build target
         working-directory: source
