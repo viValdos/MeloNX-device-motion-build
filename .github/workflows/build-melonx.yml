@@ -35,6 +35,17 @@ jobs:
         with:
           global-json-file: source/global.json
 
+      - name: Check toolchain and motion logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          dotnet --info
+          python3 verify-motion.py source
+
+      # Must run AFTER verify-motion.py: that script runs `git diff --check` and
+      # requires that only Swift/xcstrings files differ from the base commit.
       # The pinned upstream revision maps Ryujinx.LibHac only to a custom
       # "LibHacAlpha" feed that no longer serves it, so restore fails with
       # NU1101. This removes that feed so the package resolves from nuget.org.
@@ -74,15 +85,6 @@ jobs:
           echo "--- nuget.config after ---"; cat "$cfg"
           echo "--- pinned LibHac version ---"
           grep -rn "LibHac" Directory.Packages.props || true
-
-      - name: Check toolchain and motion logic
-        shell: bash
-        run: |
-          set -euo pipefail
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-version
-          dotnet --info
-          python3 verify-motion.py source
 
       - name: Build using the repository's Xcode scheme and its .NET build target
         working-directory: source
